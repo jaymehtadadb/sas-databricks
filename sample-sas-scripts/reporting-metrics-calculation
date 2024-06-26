@@ -1,0 +1,367 @@
+%md
+
+#![Spark Logo Tiny](https://files.training.databricks.com/images/wiki-book/general/logo_spark_tiny.png) Things to consider
+
+
+* SAS is a complex language with procedures, SAS SQL and Data Step
+* With Spark as the engine, Databricks also has SQL queries and Spark methods
+* Based on our experience and best practices, in this example we chose to translate SAS SQL to Databricks SQL and non-SQL SAS code to spark methods which based on our expertise might be more closer and direct translation
+%md
+#![Spark Logo Tiny](https://files.training.databricks.com/images/wiki-book/general/logo_spark_tiny.png) Disclaimer
+
+This example shows the Databricks interpretation of the common SAS Data Analytical script
+
+This example have one  difference from the original script. The original SAS script uses data directly from the real Database tables, and assumed that fresh data exists every time the script is being run. For this learning sample, static synthetic data samples are used as an input. Some additional logic and date offsets were added to the code to make it work on stale data.
+%md
+### What is this SAS code doing?
+
+%md
+Script logic is based on the existing historic fulfillment reporting flow for inbound marketing
+campaigns:
+1. The ‘last_report_max_date’ is being selected from the reporting table
+2. Customer actions are being downloaded from the IBRO schema (BDWPROD database)
+3. The offers, sent by SAS RTDM is being downloaded from RTDMPRS database
+4. File with Model scores is being uploaded from the external Excel spreadsheet and then
+cleansed in order to keep one row per ECID
+5. Scores are being merged to RTDM data and the resulted dataset is cleansed
+6. IBRO facts are being merged to RTDM offers and ‘Resolution’ column is being calculated
+for each offer
+7. Additional dataset with IBRO facts not presented in RTDM data is being prepared
+8. Both resulted datasets are being merged and appended to existing reporting table
+9. Resulted dataset also being exported to CSV
+%md
+### Module 1: Libraries and Macro Variables Initialization
+%md
+
+#![Spark Logo Tiny](https://files.training.databricks.com/images/wiki-book/general/logo_spark_tiny.png) Original SAS Code 
+
+    LIBNAME TARGET BASE "/sasnfscmt/VAAR/SAS-to-DTB/TARGET";`
+
+    libname APP_IBRO ORACLE USER=GP12061777 PASSWORD='{SAS002}23B6882C2D129A10373AA50720F488CE1DAAB71E'
+    path= '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=exa009mdc-scan2.com)(PORT=1531))
+    (CONNECT_DATA=(SERVER=DEDICATED)(SERVICE_NAME=ExaODIN_SN)))'
+    SCHEMA=APP_IBRO READBUFF=10000 SQL_FUNCTIONS=ALL;
+    
+    libname SASRTDM ORACLE USER=SASRTDM PASSWORD='{SAS002}1B3D105153E3082A1CDC01E727F04A3E401EDBC9'
+    path= '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=exa009mdc-scan2.com)(PORT=1531))
+    (CONNECT_DATA=(SERVER=DEDICATED)(SERVICE_NAME=RTDMPRS)))'
+    SCHEMA=SASRTDM READBUFF=10000 SQL_FUNCTIONS=ALL;
+    
+    data _null_;
+    %global today;
+    %global time;
+    tod_str = compress(put(dateTIME(),datetime14.), ':');    
+    call symput('today', compress(tod_str));
+    call symput('time', compress(put(dateTIME(),timeampm.)));
+    run;
+    
+    %let model_path = /sasnfscmt/VAAR/SAS-to-DTB/SOURCE;
+    
+    %let export_path = /sasnfscmt/VAAR/SAS-to-DTB/TARGET;
+%md
+### Translated PySpark code
+
+In SAS, a library points to a particular location on a drive where a collection of sas datasets are stored. This could be on a local network drive, a filesystem, or a remote database. Using the `libname` assigned to a library allows you to reference a dataset within a library.  
+
+In Databricks, access to the database and tables is driven by [Table Access Control List](https://learn.microsoft.com/en-us/azure/databricks/data-governance/table-acls/) and is persisted outside of a session or an individual cluster.
+
+A Databricks database is a collection of tables. A [Databricks table](https://docs.databricks.com/data/tables.html#) is a collection of structured data. You can cache, filter, and perform any operations supported by Apache Spark DataFrames on Databricks tables. You can query tables with Spark APIs and Spark SQL.
+import datetime as dttm
+
+# debug_mode = {0, 1} - identifies whether the display/show statements will be executed in the cells
+# Extra display/show steps are useful for debugging, but affect performance forcing Spark to evaluate intermediate datasteps that otherwise it did not have to execute separately.
+# The recommendation is to set debug_mode to 0 before scheduling the job for recurrent execution.
+debug_mode = 1
+
+# Defining variables
+today = dttm.date.today().strftime("%Y-%m-%d")
+time = dttm.datetime.now().strftime("%H-%M-%S")
+model_path = "/Workspace/Users/jay.mehta@databricks.com/SAS-Databricks-Workshop/Includes/model_score_fake.csv"
+export_path = "/Workspace/Users/jay.mehta@databricks.com/SAS-Databricks-Workshop/Target/"
+
+#This variable not presented in original SAS script. Was added to resolve the 'Stale Data' problem, make the script operational for repeated execution while input data remains stale.
+report_start_date_offset = 10
+
+if debug_mode:
+   display(today, ",", time, ",", model_path, ",", export_path, ",", report_start_date_offset)
+%md
+### Module 2: Get Last Report Max Date
+%md
+
+#![Spark Logo Tiny](https://files.training.databricks.com/images/wiki-book/general/logo_spark_tiny.png) Original SAS Code
+
+`%let last_report_max_date;`
+
+
+    proc sql;
+    select
+    datepart(max(EVENT_DT)) format=yymmdd10.
+    into: report_min_date
+    from TARGET.RTDM_FULFILLMENT_REPORT_HIST;
+    quit;
+%md
+### Translated PySpark code
+max_date_scalar = spark.sql("select max(EVENT_DT) from self_serve_schema.rtdm_fulfillment_report_hist").limit(1).collect()[0]
+#display(max_date_scalar)
+max_date_with_offset = max_date_scalar[0] - dttm.timedelta(report_start_date_offset) #the offest is applied to resolve the 'Static Data' problem
+last_report_max_date = max_date_with_offset.strftime("%Y-%m-%d")
+
+if debug_mode:
+  display(last_report_max_date)
+%md
+### Module 3: Download Data to Temporary Dataframes
+%md
+
+#![Spark Logo Tiny](https://files.training.databricks.com/images/wiki-book/general/logo_spark_tiny.png) Original SAS Code 
+
+    proc sql;
+    CREATE TABLE WORK.BDW_DATA AS
+    SELECT ...
+    quit;
+
+    proc sql;
+    CREATE TABLE WORK.RTDM_DATA AS
+    SELECT ...
+    quit;
+%md
+#![Spark Logo Tiny](https://files.training.databricks.com/images/wiki-book/general/logo_spark_tiny.png) Translated PySpark code
+
+**You can perform any PROC SQL operations on Databricks using Spark SQL almost exactly the same as you do in SAS.**    
+Simply use `spark.sql("some code")` with the SQL code you want to use.
+
+In this notebook, we will focus on generating temporary dataframes
+bdw_data_df = spark.sql("""
+SELECT distinct t1.ENTERPRISE_ID as ECID, t1.REPORT_DATE
+FROM vw_drvd_app_ibro.IBRO_HOUSEHOLD_ACTIVITY_FAKE t1
+INNER JOIN vw_drvd_app_ibro.IBRO_SUBSCRIBER_ACTIVITY_FAKE t2
+  ON t1.ENTERPRISE_ID <=> t2.ENTERPRISE_ID
+   and t1.CUSTOMER_ACCOUNT <=> t2.CUSTOMER_ACCOUNT
+   and t1.CUSTOMER_ID <=> t2.CUSTOMER_ID
+   and t1.REPORT_DATE <=> t2.ACTIVITY_DATE
+WHERE
+     t1.REPORT_DATE >= '{last_report_max_date}'
+ and t2.ACTIVITY not in ('OP', 'CL')
+ """.format(last_report_max_date=last_report_max_date))
+
+rtdm_data_df = spark.sql("""
+SELECT distinct
+  t1.EVENT_DT,
+  ECID,
+  (case when t1.Line_of_Business IN( 'F','I') then 'X' else 'Y' end) AS BRAND,
+  t1.TREATMENT_TYPE,  
+  t1.DISPOSITION,
+  t1.OFFER_OR_ACTION
+FROM vw_drvd_app_ibro.CMT_REPORTING_ALL_FAKE t1
+WHERE
+     t1.EVENT_DT >= '{last_report_max_date}'
+ and t1.OFFER_OR_ACTION <=> 'Offer' 
+""".format(last_report_max_date=last_report_max_date))
+ 
+if debug_mode:
+  display(bdw_data_df)
+  display(rtdm_data_df)
+%md
+### Module 4: Import Files
+%md
+### Importing the uploaded CSV file with Model Scores (from the Workspace file) - make sure not to upload any PII information this way!
+%md
+
+#![Spark Logo Tiny](https://files.training.databricks.com/images/wiki-book/general/logo_spark_tiny.png) Original SAS Code 
+
+`/*Import Model Scores*/`
+
+    proc import out=WORK.MODEL_SCORES`
+    datafile = "&model_path/Model_Scores.xlsx"`
+    dbms = xlsx replace;
+    getnames = yes;
+%md
+#![Spark Logo Tiny](https://files.training.databricks.com/images/wiki-book/general/logo_spark_tiny.png) Translated PySpark code
+
+import pandas as pd
+
+pandas_df = pd.read_csv(model_path)
+model_scores_df = spark.createDataFrame(pandas_df)
+
+if debug_mode:
+  model_scores_df.show(5)
+%md
+### Module 5: Aggregation and Joins
+%md
+
+#![Spark Logo Tiny](https://files.training.databricks.com/images/wiki-book/general/logo_spark_tiny.png) Original SAS Code 
+
+    proc summary data=WORK.MODEL_SCORES;
+    class ECID;
+    var Score;
+    output out=WORK.MODEL_SCORES_AGGREGATED max=;
+    run;
+
+    proc sort data=WORK.RTDM_DATA;
+    by ECID;
+    run;
+
+    proc sort data=WORK.MODEL_SCORES_AGGREGATED;
+    by ECID;
+    run;
+
+    data WORK.RTDM_MODEL;
+    merge WORK.RTDM_DATA (in = in_rtdm)
+          WORK.MODEL_SCORES_AGGREGATED (in = in_scores);
+    by ECID;
+    if in_rtdm;
+    run;
+%md
+#![Spark Logo Tiny](https://files.training.databricks.com/images/wiki-book/general/logo_spark_tiny.png) Translated PySpark code
+model_scores_aggregated_df = (model_scores_df
+  .groupBy("ecid")
+  .max("score")
+  .withColumnRenamed("max(score)", "score")
+)
+
+#Sorting (SAS PROC SORTs) in most cases is not needed in Spark. Can be skipped.
+#  rtdm_model_df = rtdm_model_df.orderBy("ecid", ascending=[1,1,0])
+#  model_scores_aggregated_df = model_scores_aggregated_df.orderBy("ecid", ascending=[1,1,0])
+
+rtdm_model_df = rtdm_data_df.join(model_scores_aggregated_df, how="left", on="ecid")
+
+#Note, SAS MERGE BY and Spark JOIN are not 100% equivalent and may behave differently. 
+# For example, if both input tables have a similarly-named column. Or, if both tables are non-unique by the join key.
+# But in our case here this does not apply and a simple join can be used.
+
+
+if debug_mode:
+  display(model_scores_aggregated_df)
+  display(rtdm_model_df)  
+%md
+### Module 5: Filtering and Cleansing
+%md
+
+#![Spark Logo Tiny](https://files.training.databricks.com/images/wiki-book/general/logo_spark_tiny.png) Original SAS Code 
+
+    data WORK.RTDM_FINAL;
+    set WORK.RTDM_MODEL;
+    where DISPOSITION <> 'Generated';
+    ECID_NUM = input(ECID, 15.);
+    rename ECID=ECID_CHAR
+           ECID_NUM = ECID
+           SCORE = PTB_SCORE;
+    drop OFFER_OR_ACTION ECID_CHAR;
+    run;
+%md
+#![Spark Logo Tiny](https://files.training.databricks.com/images/wiki-book/general/logo_spark_tiny.png) Translated PySpark code
+from pyspark.sql.types import IntegerType
+import pyspark.sql.functions as psf
+
+rtdm_final_df = (
+  rtdm_model_df
+  .filter(psf.col("disposition") != "Generated")
+  .filter(psf.col("score").isNotNull())
+  #The next step is not technically needed, as ECID in the input data is already of an Integer type. 
+  #However since the original SAS script had this conversion to ECID_NUM (which was also not needed), it is also shown here (as an example)
+  .withColumn("ecid",psf.col("ecid").cast(IntegerType()))
+  .withColumnRenamed("score", "ptb_score")
+  .drop("offer_or_action")
+)
+
+if debug_mode:
+  rtdm_final_df.display()
+%md
+
+### `PROC SORT`
+
+
+As we mentioned previously, you do NOT have to sort datasets before performing operations in Spark. However, there may be times you would want to sort for visualization purposes. To do this, use the [`orderBy` method](https://spark.apache.org/docs/3.1.1/api/python/reference/api/pyspark.sql.DataFrame.orderBy.html). You can sort on multiple fields and by ascending or descending order, per field. 
+
+You can chain multiple operations into one statement, as we demonstrated in the above cell using some of the methods. Take a look and make sure you understand what each step is doing.
+%md
+### Module 6: Creating Final Dataframe
+%md
+
+#![Spark Logo Tiny](https://files.training.databricks.com/images/wiki-book/general/logo_spark_tiny.png) Original SAS Code 
+
+    proc sql;
+    CREATE TABLE WORK.RTDM_STATS AS
+    SELECT
+    rtdm.ECID,
+    rtdm.PTB_SCORE,
+    CASE
+        WHEN rtdm.PTB_SCORE > 0.5 AND bdw.ECID is not null THEN input('TRUE_HIT', $15.)
+        WHEN rtdm.PTB_SCORE > 0.5 AND bdw.ECID is null THEN input('FALSE_MISS', $15.)
+        WHEN rtdm.PTB_SCORE <= 0.5 AND bdw.ECID is not null THEN input('FALSE_HIT', $15.)
+        WHEN rtdm.PTB_SCORE <= 0.5 AND bdw.ECID is null THEN input('TRUE_MISS', $15.)
+    END as RESOLUTION
+    from WORK.RTDM_FINAL rtdm
+    left join WORK.BDW_DATA bdw ON bdw.ECID = rtdm.ECID;
+    run;
+
+    proc sql;
+    CREATE TABLE WORK.UNIDENTIFIED_HITS AS
+    SELECT
+    bdw.ECID,
+    -1.0 as PTB_SCORE,
+    input('UNDEFINED_HIT', $15.) as RESOLUTION
+    from WORK.BDW_DATA bdw
+    left join WORK.RTDM_FINAL rtdm on rtdm.ECID = bdw.ECID
+    where
+    rtdm.ECID is NULL;
+    run;
+
+    proc append
+    base=WORK.RTDM_STATS
+    data=WORK.UNIDENTIFIED_HITS;
+    run;
+%md
+#![Spark Logo Tiny](https://files.training.databricks.com/images/wiki-book/general/logo_spark_tiny.png) Translated PySpark code
+rtdm_stats_df = (
+  rtdm_final_df.alias("rtdm")
+  .join(bdw_data_df.alias("bdw"), psf.col("rtdm.ecid") == psf.col("bdw.ecid"), "left")
+  .withColumn("resolution", psf.when((psf.col("ptb_score") > 0.5) & (psf.col("bdw.ecid").isNotNull()), 'TRUE_HIT')
+                           .when((psf.col("ptb_score") > 0.5) & (psf.col("bdw.ecid").isNull()), 'FALSE_MISS')
+                           .when((psf.col("ptb_score") <= 0.5) & (psf.col("bdw.ecid").isNotNull()), 'FALSE_HIT')
+                           .when((psf.col("ptb_score") <= 0.5) & (psf.col("bdw.ecid").isNull()), 'TRUE_MISS'))
+  .select("rtdm.ecid", "ptb_score", "resolution", "event_dt")
+)
+
+unidentified_hits_df = (
+  bdw_data_df.alias("bdw")
+  .join(rtdm_final_df.alias("rtdm"), how="left", on="ecid")
+  .filter(psf.col("rtdm.ecid").isNull())
+  .withColumn("resolution", psf.lit("UNIDENTIFED_HIT"))
+  .select("ecid", "ptb_score", "resolution", "report_date")
+  .withColumnRenamed("report_date", "event_dt")
+)
+
+rtdm_stats_df = rtdm_stats_df.unionByName(unidentified_hits_df)
+
+if debug_mode:
+  display(rtdm_stats_df)
+%md
+### Module 7: Load Data in Persistent Table and Export CSV File
+%md
+
+#![Spark Logo Tiny](https://files.training.databricks.com/images/wiki-book/general/logo_spark_tiny.png) Original SAS Code 
+
+    proc sql;
+    CREATE TABLE TARGET.RTDM_FULFILLMENT_REPORT_LAST AS
+    SELECT *
+    FROM WORK.RTDM_STATS;
+    run;
+
+    proc append
+    base=TARGET.RTDM_FULFILLMENT_REPORT_HIST
+    data=WORK.RTDM_STATS;
+    run;
+
+    proc export data=WORK.RTDM_STATS
+    dbms=dlm 
+    outfile="&export_path/RTDM_FULFILLMENT_REPORT_&today&time..csv" replace; 
+    delimiter=';'; 
+    run;
+%md
+#![Spark Logo Tiny](https://files.training.databricks.com/images/wiki-book/general/logo_spark_tiny.png) Translated PySpark code
+rtdm_stats_df.write.mode("overwrite").saveAsTable("vw_drvd_app_ibro_<user_id>.rtdm_fulfillment_report_last")
+
+rtdm_stats_df.write.mode("append").saveAsTable("vw_drvd_app_ibro_<user_id>.rtdm_fulfillment_report_hist")
+
+_pandas_df = rtdm_stats_df.toPandas()
+_pandas_df.to_csv(export_path +  "RTDM_FULFILLMENT_REPORT_{date}_{time}.csv".format(date = today, time = time))
